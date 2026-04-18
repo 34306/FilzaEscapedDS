@@ -10,4 +10,5 @@ Note: I just change the name due to requested. But i think jailed is okay then
 - Thanks to [wh1te4ever](https://github.com/wh1te4ever/) for the super details [darksword-kfun](https://github.com/wh1te4ever/darksword-kexploit-fun) with offset/XPF
 - Thanks to [opa334](https://github.com/opa334/) for the XPF/krw
 - Thanks to [CrazyMind90](https://github.com/crazymind90/) for idea how to get sbx token with krw only
+- Thanks to [roootdev](https://github.com/rooootdev) for sandbox elevate in [lara](https://github.com/rooootdev/lara)
 - And me :D

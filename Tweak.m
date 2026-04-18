@@ -6,6 +6,7 @@
 #include "kexploit/kexploit_opa334.h"
 #include "kexploit/kutils.h"
 #include "sandbox_escape.h"
+#include "apfs_own.h"
 
 #pragma mark - Root Helper Hooks
 
@@ -479,9 +480,58 @@ static void hook_activationViewDidLoad(id self, SEL _cmd) {
     NSLog(@"[Tweak] Suppressed activation nag");
 }
 
+#pragma mark - Auto-chown app bundles on navigate
+
+// Lazy, per-.app chown: when Filza lists any path inside
+// /var/containers/Bundle/Application/<UUID>/<Name>.app[/...], run
+// apfs_own_tree on that .app (one time) to flip everything to 501:501.
+
+static NSMutableSet<NSString *> *g_chowned_apps = nil;
+static dispatch_queue_t g_chown_queue = NULL;
+
+// Returns the .app root path for any path inside a Bundle/Application/<UUID>/<Name>.app,
+// or nil if the path isn't inside one.
+static NSString *app_root_for_path(NSString *path) {
+    if (![path hasPrefix:@"/var/containers/Bundle/Application/"]) return nil;
+    NSArray<NSString *> *comps = [path pathComponents];
+    for (NSUInteger i = 0; i < comps.count; i++) {
+        if ([comps[i] hasSuffix:@".app"]) {
+            return [NSString pathWithComponents:
+                [comps subarrayWithRange:NSMakeRange(0, i + 1)]];
+        }
+    }
+    return nil;
+}
+
+static void ensure_app_chowned_async(NSString *path) {
+    NSString *appRoot = app_root_for_path(path);
+    if (!appRoot) return;
+
+    @synchronized(g_chowned_apps) {
+        if ([g_chowned_apps containsObject:appRoot]) return;
+        [g_chowned_apps addObject:appRoot];
+    }
+
+    dispatch_async(g_chown_queue, ^{
+        NSLog(@"[Tweak] auto-chown: %@", appRoot);
+        apfs_own_tree([appRoot UTF8String], 501, 501);
+    });
+}
+
+static IMP orig_contentsOfDirectory = NULL;
+static id hook_contentsOfDirectory(id self, SEL _cmd, id path, NSError **error) {
+    if ([path isKindOfClass:[NSString class]]) {
+        ensure_app_chowned_async((NSString *)path);
+    }
+    return ((id(*)(id,SEL,id,NSError**))orig_contentsOfDirectory)(self, _cmd, path, error);
+}
+
 #pragma mark - Hook Installation
 
 static void installHooks(void) {
+    if (!g_chowned_apps) g_chowned_apps = [NSMutableSet new];
+    if (!g_chown_queue) g_chown_queue = dispatch_queue_create("com.filza.autochown", DISPATCH_QUEUE_SERIAL);
+
     Class rfm = NSClassFromString(@"TGRootFileManager");
     if (rfm) {
         Class meta = object_getClass(rfm);
@@ -497,6 +547,13 @@ static void installHooks(void) {
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplySync:fileDescriptor:logintty:"), (IMP)hook_sendObjectWithReplySync_fd_logintty, "@@:@^iB");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectNoReply:"), (IMP)hook_sendObjectNoReply, "v@:@");
         class_replaceMethod(rfm, NSSelectorFromString(@"sendObjectWithReplyAsync:queue:completion:"), (IMP)hook_sendObjectWithReplyAsync, "v@:@@?");
+
+        // Auto-chown .app on first listing of anything inside it.
+        Method cod = class_getInstanceMethod(rfm, NSSelectorFromString(@"contentsOfDirectoryAtPath:error:"));
+        if (cod) {
+            orig_contentsOfDirectory = method_getImplementation(cod);
+            method_setImplementation(cod, (IMP)hook_contentsOfDirectory);
+        }
     }
     Class zipper = NSClassFromString(@"Zipper");
     if (zipper) {
@@ -564,6 +621,14 @@ static void runExploit(void) {
     uint64_t self_proc_addr = proc_self();
     int sret = sandbox_escape(self_proc_addr);
     NSLog(@"[Tweak] sandbox_escape returned %d", sret);
+
+    // For root-owned paths that fail DAC, use apfs_own(path, 501, 501) to
+    // flip on-disk ownership to mobile before opening. Example:
+    //     if (apfs_own("/var/root/.somefile", 501, 501) == 0) { ... }
+
+    // Auto-chown runs lazily via the contentsOfDirectoryAtPath: hook: the
+    // first time Filza lists anything inside /var/containers/Bundle/Application/
+    // <UUID>/<Name>.app, apfs_own_tree fires on that .app in the background.
 }
 
 #pragma mark - Entry Point

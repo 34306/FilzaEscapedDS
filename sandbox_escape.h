@@ -5,8 +5,10 @@
 
 // Escape sandbox by rewriting sandbox extension data in kernel memory.
 // Walk: proc_ro -> ucred -> cr_label -> sandbox -> ext_set -> ext_table -> ext -> data
-// Uses dynamic offset resolution — works on iOS 17.0 through 26.x.
-// Returns 0 on success, -1 on failure.
 int sandbox_escape(uint64_t self_proc);
+
+// Elevate to uid=0 by swapping our p_ucred pointer with launchd's.
+// Fixes UNIX DAC (owner/mode) checks so chmod/chown/writes to root-owned
+int sandbox_elevate_to_root(uint64_t self_proc);
 
 #endif
